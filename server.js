@@ -2,7 +2,9 @@ require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const multerS3 = require('multer-s3');
-const AWS = require('aws-sdk');
+const { S3Client } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { GetObjectCommand, HeadObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
@@ -55,13 +57,13 @@ app.use((req, res, next) => {
   next();
 });
 // AWS S3 Configuration
-AWS.config.update({
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  region: process.env.AWS_REGION
+const s3 = new S3Client({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
 });
-
-const s3 = new AWS.S3();
 const storage = multerS3({
   s3: s3,
   bucket: process.env.S3_BUCKET_NAME,
@@ -105,9 +107,22 @@ const upload = multer({
 
 app.post('/upload', upload.single('file'), (req, res) => {
   try {
+    console.log('📁 [UPLOAD DEBUG] Request received');
+    console.log('📁 [UPLOAD DEBUG] File in request:', !!req.file);
+    console.log('📁 [UPLOAD DEBUG] Body keys:', Object.keys(req.body || {}));
+    
     if (!req.file) {
+      console.log('❌ [UPLOAD ERROR] No file in request');
       return res.status(400).json({ error: 'No se ha seleccionado ningún archivo' });
     }
+
+    console.log('📁 [UPLOAD DEBUG] File details:', {
+      key: req.file.key,
+      originalname: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+      location: req.file.location
+    });
 
     const fileInfo = {
       id: req.file.key,
@@ -119,11 +134,14 @@ app.post('/upload', upload.single('file'), (req, res) => {
       url: req.file.location
     };
 
+    console.log('✅ [UPLOAD SUCCESS] File uploaded successfully');
     res.json({
       message: 'Archivo subido exitosamente',
       file: fileInfo
     });
   } catch (error) {
+    console.error('❌ [UPLOAD ERROR] Unexpected error in try-catch:', error);
+    console.error('❌ [UPLOAD ERROR] Error stack:', error.stack);
     res.status(500).json({ error: 'Error al subir el archivo' });
   }
 });
@@ -135,7 +153,8 @@ app.get('/files', async (req, res) => {
       Prefix: 'uploads/'
     };
 
-    const data = await s3.listObjectsV2(params).promise();
+    const { ListObjectsV2Command } = require('@aws-sdk/client-s3');
+    const data = await s3.send(new ListObjectsV2Command(params));
     
     const fileList = data.Contents.map(object => {
       return {
@@ -165,19 +184,16 @@ app.get('/files/:filename(*)', async (req, res) => {
 
     // Verificar si el archivo existe
     try {
-      await s3.headObject(params).promise();
+      await s3.send(new HeadObjectCommand(params));
     } catch (error) {
-      if (error.code === 'NotFound') {
+      if (error.name === 'NotFound') {
         return res.status(404).json({ error: 'Archivo no encontrado' });
       }
       throw error;
     }
 
     // Generar URL de descarga
-    const downloadUrl = s3.getSignedUrl('getObject', {
-      ...params,
-      Expires: 3600 // 1 hora
-    });
+    const downloadUrl = await getSignedUrl(s3, new GetObjectCommand(params), { expiresIn: 3600 });
 
     res.redirect(downloadUrl);
   } catch (error) {
@@ -197,16 +213,16 @@ app.delete('/files/:filename(*)', async (req, res) => {
 
     // Verificar si el archivo existe antes de eliminar
     try {
-      await s3.headObject(params).promise();
+      await s3.send(new HeadObjectCommand(params));
     } catch (error) {
-      if (error.code === 'NotFound') {
+      if (error.name === 'NotFound') {
         return res.status(404).json({ error: 'Archivo no encontrado' });
       }
       throw error;
     }
 
     // Eliminar archivo
-    await s3.deleteObject(params).promise();
+    await s3.send(new DeleteObjectCommand(params));
     res.json({ message: 'Archivo eliminado exitosamente' });
   } catch (error) {
     console.error('Error al eliminar archivo:', error);
@@ -229,17 +245,39 @@ app.get('/', (req, res) => {
 });
 
 app.use((error, req, res, next) => {
+  console.error('🚨 [ERROR HANDLER] Error caught:', error.message);
+  console.error('🚨 [ERROR HANDLER] Error type:', error.constructor.name);
+  console.error('🚨 [ERROR HANDLER] Error code:', error.code);
+  console.error('🚨 [ERROR HANDLER] Full error:', error);
+  console.error('🚨 [ERROR HANDLER] Stack trace:', error.stack);
+  
   if (error instanceof multer.MulterError) {
+    console.log('📤 [MULTER ERROR] Multer error detected:', error.code);
     if (error.code === 'LIMIT_FILE_SIZE') {
       return res.status(400).json({ error: 'El archivo es demasiado grande (máximo 10MB)' });
     }
+    if (error.code === 'LIMIT_UNEXPECTED_FILE') {
+      return res.status(400).json({ error: 'Campo de archivo inesperado' });
+    }
+    return res.status(400).json({ error: `Error de Multer: ${error.message}` });
   }
   
   if (error.message === 'Tipo de archivo no permitido') {
+    console.log('📋 [FILE FILTER] File type not allowed');
     return res.status(400).json({ error: 'Tipo de archivo no permitido' });
   }
 
-  res.status(500).json({ error: 'Error interno del servidor' });
+  // AWS S3 errors
+  if (error.code && error.code.startsWith('AWS')) {
+    console.log('☁️ [AWS ERROR] AWS S3 error:', error.code, error.message);
+    return res.status(500).json({ error: `Error de AWS S3: ${error.message}` });
+  }
+
+  console.log('❓ [UNKNOWN ERROR] Unhandled error type');
+  res.status(500).json({ 
+    error: 'Error interno del servidor',
+    details: process.env.NODE_ENV === 'development' ? error.message : undefined
+  });
 });
 
 app.listen(PORT, () => {
