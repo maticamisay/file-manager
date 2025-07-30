@@ -195,7 +195,12 @@ app.get('/files/:filename(*)', async (req, res) => {
     // Generar URL de descarga
     const downloadUrl = await getSignedUrl(s3, new GetObjectCommand(params), { expiresIn: 3600 });
 
-    res.redirect(downloadUrl);
+    res.json({
+      message: 'URL de descarga generada exitosamente',
+      downloadUrl: downloadUrl,
+      filename: filename,
+      expiresIn: 3600 // seconds (1 hour)
+    });
   } catch (error) {
     console.error('Error al descargar archivo:', error);
     res.status(500).json({ error: 'Error al descargar el archivo' });
