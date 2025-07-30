@@ -8,10 +8,52 @@ const fs = require('fs');
 const cors = require('cors');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
+
+// Middleware de logging para requests
+app.use((req, res, next) => {
+  const startTime = Date.now();
+  const timestamp = new Date().toISOString();
+  
+  console.log(`[${timestamp}] ➤ ${req.method} ${req.url}`);
+  console.log(`  ├─ IP: ${req.ip || req.connection.remoteAddress}`);
+  console.log(`  ├─ User-Agent: ${req.get('User-Agent') || 'N/A'}`);
+  
+  if (req.method !== 'GET' && Object.keys(req.body || {}).length > 0) {
+    console.log(`  ├─ Body: ${JSON.stringify(req.body, null, 2)}`);
+  }
+  
+  // Override res.json to log response
+  const originalJson = res.json;
+  res.json = function(body) {
+    const endTime = Date.now();
+    const duration = endTime - startTime;
+    
+    console.log(`[${new Date().toISOString()}] ✓ ${req.method} ${req.url} - ${res.statusCode} (${duration}ms)`);
+    console.log(`  └─ Response: ${JSON.stringify(body, null, 2)}`);
+    console.log('');
+    
+    return originalJson.call(this, body);
+  };
+  
+  // Override res.redirect to log redirects
+  const originalRedirect = res.redirect;
+  res.redirect = function(url) {
+    const endTime = Date.now();
+    const duration = endTime - startTime;
+    
+    console.log(`[${new Date().toISOString()}] ↗ ${req.method} ${req.url} - 302 REDIRECT (${duration}ms)`);
+    console.log(`  └─ Redirect to: ${url}`);
+    console.log('');
+    
+    return originalRedirect.call(this, url);
+  };
+  
+  next();
+});
 // AWS S3 Configuration
 AWS.config.update({
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
