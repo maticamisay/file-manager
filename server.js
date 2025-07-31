@@ -8,6 +8,7 @@ const { GetObjectCommand, HeadObjectCommand, DeleteObjectCommand } = require('@a
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
+const { Redis } = require('@upstash/redis');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -63,6 +64,12 @@ const s3 = new S3Client({
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
+});
+
+// Redis Configuration
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 const storage = multerS3({
   s3: s3,
@@ -207,6 +214,68 @@ app.get('/files/:filename(*)', async (req, res) => {
   }
 });
 
+// Cached version of the file download endpoint
+app.get('/files-cached/:filename(*)', async (req, res) => {
+  try {
+    const filename = req.params.filename;
+    const cacheKey = `file:${filename}`;
+    
+    // Check cache first
+    const cachedData = await redis.get(cacheKey);
+    if (cachedData) {
+      console.log(`🚀 [CACHE HIT] Serving cached URL for: ${filename}`);
+      return res.json({
+        message: 'URL de descarga generada exitosamente (desde cache)',
+        downloadUrl: cachedData.downloadUrl,
+        filename: filename,
+        expiresIn: cachedData.expiresIn,
+        cached: true,
+        cacheTimestamp: cachedData.timestamp
+      });
+    }
+    
+    console.log(`💾 [CACHE MISS] Generating new URL for: ${filename}`);
+    
+    const params = {
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: filename
+    };
+
+    // Verificar si el archivo existe
+    try {
+      await s3.send(new HeadObjectCommand(params));
+    } catch (error) {
+      if (error.name === 'NotFound') {
+        return res.status(404).json({ error: 'Archivo no encontrado' });
+      }
+      throw error;
+    }
+
+    // Generar URL de descarga
+    const downloadUrl = await getSignedUrl(s3, new GetObjectCommand(params), { expiresIn: 3600 });
+    
+    // Store in cache for 50 minutes (shorter than URL expiration)
+    const cacheData = {
+      downloadUrl: downloadUrl,
+      expiresIn: 3600,
+      timestamp: new Date().toISOString()
+    };
+    
+    await redis.setex(cacheKey, 3000, JSON.stringify(cacheData)); // 50 minutes
+
+    res.json({
+      message: 'URL de descarga generada exitosamente',
+      downloadUrl: downloadUrl,
+      filename: filename,
+      expiresIn: 3600,
+      cached: false
+    });
+  } catch (error) {
+    console.error('Error al descargar archivo (cached):', error);
+    res.status(500).json({ error: 'Error al descargar el archivo' });
+  }
+});
+
 app.delete('/files/:filename(*)', async (req, res) => {
   try {
     const filename = req.params.filename;
@@ -244,6 +313,7 @@ app.get('/', (req, res) => {
       'POST /upload': 'Subir archivo',
       'GET /files': 'Listar archivos',
       'GET /files/:filename': 'Descargar archivo',
+      'GET /files-cached/:filename': 'Descargar archivo (con cache Redis)',
       'DELETE /files/:filename': 'Eliminar archivo'
     }
   });
